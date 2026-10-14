@@ -254,6 +254,27 @@ egress. HTTP/SSE fallback retains Bun fetch's own proxy rules, which do not cons
 The endpoint handles `response.create`, ignores `response.processed`, supports warmup
 `generate: false`, and feeds the same request pipeline as HTTP/SSE.
 
+Incoming Responses connections share a 128-socket admission limit. Only when a new upgrade
+finds that limit full, the handler reclaims the least recently used eligible idle connection.
+Message handling and turn completion refresh a monotonic use order; connection age alone
+does not choose the victim. Eligibility requires an open socket, no active turn, no pending
+client tool or approval result, no retained native steering/injection owner, and no buffered
+outbound bytes. A superseded turn remains active until its own cleanup finishes.
+
+Tool and approval identities are tracked across output items and terminal snapshots, and
+only matching client or upstream results retire them. Tracking is bounded; an overflow conservatively
+protects the connection until close. A terminal response that asks the client to execute a
+tool therefore does not make the connection idle while that tool runs.
+
+The victim is marked closing before sending close code 1001 with reason
+`Idle Responses connection reclaimed`. Only its ordinary close callback releases the
+admission lease; the upgrade retries reservation once afterward. If every socket is protected,
+the close fails, or the lease has not yet been released, admission retains the existing HTTP
+503 `Codex WebSockets capacity reached` response without exceeding the limit. Reclamation
+does not delete saved continuation state; a client can reconnect through the existing upgrade
+and replay path. This policy adds no idle timer or configuration and does not change the
+separate Live/Realtime sockets or upstream connection reuse.
+
 Registry-declared per-model compatibility hints (`modelResponsesUpstreamStreaming`) may ask the
 upstream Responses endpoint for bounded JSON on ANY client transport — WebSocket or ordinary
 HTTP/SSE. The bridge reframes that JSON into the same Responses event sequence
