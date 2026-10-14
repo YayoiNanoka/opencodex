@@ -276,9 +276,10 @@ suppression. `tests/responses/ws-capacity-tool-ownership.test.ts` covers these o
 
 The victim is marked closing before sending close code 1001 with reason
 `Idle Responses connection reclaimed`. Only its ordinary close callback releases the
-admission lease; the upgrade retries reservation once afterward. If every socket is protected,
-the close fails, or the lease has not yet been released, admission retains the existing HTTP
-503 `Codex WebSockets capacity reached` response without exceeding the limit. Reclamation
+admission lease. After requesting closure, the current upgrade immediately attempts reservation once.
+If every socket is protected, the close fails, or the callback has not yet released the lease,
+that upgrade receives the existing HTTP 503 `Codex WebSockets capacity reached` response.
+A later upgrade can acquire the released slot; admission never exceeds the limit. Reclamation
 does not delete saved continuation state; a client can reconnect through the existing upgrade
 and replay path. This policy adds no idle timer or configuration and does not change the
 separate Live/Realtime sockets or upstream connection reuse.

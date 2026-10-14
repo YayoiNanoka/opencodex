@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../../src/config";
 import { codexWebSocketAdmissionMetrics, MAX_TRACKED_CODEX_WEBSOCKETS } from "../../src/codex/websocket-registry";
+import {
+  clearResponseStateForTests, clearResponseStateMemoryForTests, RESPONSE_TTL_MS,
+  responseStateMetrics, sweepExpiredResponseStates,
+} from "../../src/responses/state";
 import { startServer } from "../../src/server";
 import type { OcxConfig } from "../../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
@@ -20,6 +24,8 @@ let proxy: ReturnType<typeof startServer> | undefined;
 let upstream: ReturnType<typeof Bun.serve> | undefined;
 let finishStream: (() => void) | undefined;
 let upstreamRequests = 0;
+let upstreamCancellations = 0;
+const upstreamBodies: Frame[] = [];
 const clients: Client[] = [];
 
 async function until(condition: () => boolean, description: string): Promise<void> {
@@ -37,8 +43,11 @@ function sse(event: Frame): Uint8Array {
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ocx-ws-capacity-"));
   process.env.OPENCODEX_HOME = home;
+  clearResponseStateMemoryForTests();
   codex = installIsolatedCodexHome("ocx-ws-capacity-codex-");
   upstreamRequests = 0;
+  upstreamCancellations = 0;
+  upstreamBodies.length = 0;
   finishStream = undefined;
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
@@ -52,6 +61,7 @@ beforeEach(() => {
     async fetch(request) {
       const body = await request.json() as Frame;
       upstreamRequests++;
+      upstreamBodies.push(body);
       const id = `resp_capacity_${upstreamRequests}`;
       const tool = JSON.stringify(body.input).includes("request-fixture-tool");
       const hold = JSON.stringify(body.input).includes("hold-fixture-stream");
@@ -69,6 +79,7 @@ beforeEach(() => {
           };
           if (hold) finishStream = finish; else finish();
         },
+        cancel() { upstreamCancellations++; },
       });
       return new Response(stream, { headers: { "content-type": "text/event-stream" } });
     },
@@ -77,7 +88,7 @@ beforeEach(() => {
     port: 0, hostname: "127.0.0.1", codexAutoStart: false, websockets: true,
     defaultProvider: "fixture", providers: { fixture: {
       adapter: "openai-responses", baseUrl: `${upstream.url}v1`, apiKey: "sk-capacity-fixture", upstreamWebsocket: false,
-      allowPrivateNetwork: true,
+      allowPrivateNetwork: true, statelessResponses: true,
     } },
   } as OcxConfig);
   expect(codexWebSocketAdmissionMetrics().active).toBe(0);
@@ -95,6 +106,7 @@ afterEach(async () => {
     proxy = undefined;
     upstream = undefined;
     globalThis.fetch = originalFetch;
+    clearResponseStateForTests();
     codex.restore();
     removeTreeWithRetry(home);
     if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
@@ -202,3 +214,71 @@ test("client tool execution stays protected, and all-busy saturation keeps the 5
   expect(opened.slice(1).every(client => client.socket.readyState === WebSocket.OPEN)).toBe(true);
   expectBounded();
 }, 20_000);
+
+test.each([false, true])("disconnect releases admission and allows a fresh request; abrupt=%s", async abrupt => {
+  const baseline = codexWebSocketAdmissionMetrics();
+  const client = await connect();
+  expect(codexWebSocketAdmissionMetrics().active).toBe(baseline.active + 1);
+  if (abrupt) {
+    await exchange(client, { input: "hold-fixture-stream" }, "response.created");
+    // Bun's client API terminates the real TCP connection without a closing handshake.
+    client.socket.terminate();
+  } else client.socket.close(1000, "fixture normal disconnect");
+  await until(() => Boolean(client.closed) && codexWebSocketAdmissionMetrics().active === baseline.active,
+    "disconnected socket releases its reservation");
+  expect(client.closed?.code).toBe(abrupt ? 1006 : 1000);
+  if (abrupt) await until(() => upstreamCancellations === 1, "abandoned upstream stream cancelled");
+  const replacement = await connect();
+  await exchange(replacement, { input: "fresh request after disconnect" });
+  expect(upstreamRequests).toBe(abrupt ? 2 : 1);
+  replacement.socket.close();
+  await until(() => codexWebSocketAdmissionMetrics().active === baseline.active, "replacement reservation released");
+  expect(codexWebSocketAdmissionMetrics().releaseMisses).toBe(baseline.releaseMisses);
+});
+
+test("failed HTTP upgrade releases its reservation before the next handshake", async () => {
+  const baseline = codexWebSocketAdmissionMetrics();
+  const response = await fetch(new URL("/v1/responses", proxy!.url), { headers: {
+    connection: "upgrade", upgrade: "websocket", "sec-websocket-version": "13",
+    // Missing Sec-WebSocket-Key reaches Bun's unsuccessful upgrade after reservation.
+  } });
+  expect(response.status).toBe(426);
+  expect(await response.text()).toContain("WebSocket upgrade failed");
+  expect(codexWebSocketAdmissionMetrics()).toMatchObject({ active: baseline.active,
+    admitted: baseline.admitted + 1, rejected: baseline.rejected, releaseMisses: baseline.releaseMisses });
+  const replacement = await connect();
+  await exchange(replacement, { input: "fresh request after failed handshake" });
+  expect(upstreamRequests).toBe(1);
+  expect(codexWebSocketAdmissionMetrics().active).toBe(baseline.active + 1);
+});
+
+test.each([false, true])("stateless continuation after capacity reclamation preserves full history; expired=%s", async expired => {
+  const original = await connect();
+  const firstInput = { role: "user", content: [{ type: "input_text", text: "Remember the fixture number 47." }] };
+  const first = await exchange(original, { input: [firstInput], store: false });
+  const previousId = first.response.id;
+  expect(typeof previousId).toBe("string");
+  expect(previousId.length).toBeGreaterThan(0);
+  await until(() => responseStateMetrics().count === 1, "first response retains real continuation state");
+  for (let i = 1; i < MAX_TRACKED_CODEX_WEBSOCKETS; i++) await connect();
+  const reconnected = await connect();
+  await until(() => original.closed?.code === 1001, "socket holding the response ID reclaimed");
+  if (expired) {
+    expect(sweepExpiredResponseStates(Date.now() + RESPONSE_TTL_MS + 60_000)).toBe(1);
+    expect(responseStateMetrics().count).toBe(0);
+  }
+  const delta = { role: "user", content: [{ type: "input_text", text: "Use that number in the next answer." }] };
+  const outcome = await exchange(reconnected, { previous_response_id: previousId, input: [delta], store: false },
+    expired ? "error" : "response.completed");
+  if (expired) {
+    expect(outcome).toMatchObject({ type: "error", status: 400, error: { code: "previous_response_not_found" } });
+    expect(upstreamRequests).toBe(1); // Never forward the delta without its missing prefix.
+    await exchange(reconnected, { input: [firstInput, ...first.response.output, delta], store: false });
+  }
+  expect(upstreamRequests).toBe(2); // One initial response and one complete continuation, without a duplicate execution.
+  expect(upstreamBodies[1]!.previous_response_id).toBeUndefined();
+  expect(upstreamBodies[1]!.input).toHaveLength(3);
+  expect(upstreamBodies[1]!.input).toMatchObject([firstInput,
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "capacity fixture completed" }] }, delta]);
+  expectBounded();
+}, 15_000);
