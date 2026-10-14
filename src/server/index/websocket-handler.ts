@@ -89,6 +89,7 @@ import {
 import type { ServeOptionsContext } from "./serve-options";
 import type { RequestMetricsRecorder } from "../request-metrics";
 import { resolveInboundBodyLimitBytes } from "../request-decompress";
+import { responseToolOwnership } from "../responses/response-tool-ownership";
 
 /**
  * The WebSocket half of the Bun.serve options, split out of serve-options.ts to keep that file
@@ -356,10 +357,11 @@ export function createWebsocketHandler(
             const observeLog = nativeControl?.relayActive
               ? createNativeSteeringLogObserver(logCtx, () => recordFirstOutput(logCtx, start))
               : (payload: string) => inspectResponseLogSsePayload(logCtx, payload);
+            const providerExecuted = responseToolOwnership(response);
             await sendResponseToWebSocket(ws, response, isCurrent, {
               untilEof: nativeControl?.relayActive === true,
               onSsePayload: payload => {
-                ws.data.responsesActivity?.observePayload(payload);
+                ws.data.responsesActivity?.observePayload(payload, providerExecuted);
                 observeLog(payload);
               },
               onTerminal: status => {

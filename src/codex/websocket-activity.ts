@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isAuthorizedProviderExecutedCall, type ProviderExecutedCallType } from "../server/responses-undeclared-tool-guard";
 
 // Logical recency avoids clock adjustments and ties between messages in one millisecond.
 let activityOrder = 0;
@@ -46,6 +47,9 @@ export class CodexWebSocketActivity {
     this.turns += 1;
     this.touch();
     this.acceptResults(input);
+    // Ordinary creates start a new response even when its upstream omits response.created.
+    // Prior results settle old waits, but cannot suppress new calls reusing their IDs.
+    this.returnedResults.clear();
     let finished = false;
     return () => {
       if (finished) return;
@@ -77,26 +81,27 @@ export class CodexWebSocketActivity {
   }
 
   /** Preserve tool waits even when the response terminal omits its output array. */
-  observePayload(payload: string): void {
+  observePayload(payload: string, providerExecuted?: ReadonlySet<ProviderExecutedCallType>): void {
     if (this.untrackedResults) return;
     let frame: unknown;
     try { frame = JSON.parse(payload); } catch { return; }
     if (!record(frame)) return;
     // Native injection can return a result before the same terminal repeats its call.
     if (frame.type === "response.created") this.returnedResults.clear();
-    if (frame.type === "response.output_item.done") this.observeOutput(frame.item);
+    if (frame.type === "response.output_item.done") this.observeOutput(frame.item, providerExecuted);
     if (["response.completed", "response.incomplete", "response.failed"].includes(String(frame.type))
       && record(frame.response) && Array.isArray(frame.response.output)) {
-      for (const item of frame.response.output) this.observeOutput(item);
+      for (const item of frame.response.output) this.observeOutput(item, providerExecuted);
     }
   }
 
-  private observeOutput(item: unknown): void {
+  private observeOutput(item: unknown, providerExecuted?: ReadonlySet<ProviderExecutedCallType>): void {
     if (this.untrackedResults) return;
     if (!record(item) || typeof item.type !== "string") return;
     // Hosted execution may publish both the call and its result in the output stream.
     this.acceptResults([item]);
     if (!Object.hasOwn(resultTypes, item.type)) return;
+    if (providerExecuted && isAuthorizedProviderExecutedCall(item, providerExecuted)) return;
     if (item.type === "tool_search_call" && item.execution !== "client") return;
     const id = item.type === "mcp_approval_request" ? item.id
       : item.type === "local_shell_call" || item.type === "tool_search_call" ? item.call_id ?? item.id : item.call_id;

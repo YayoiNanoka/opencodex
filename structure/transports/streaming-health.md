@@ -266,6 +266,14 @@ only matching client or upstream results retire them. Tracking is bounded; an ov
 protects the connection until close. A terminal response that asks the client to execute a
 tool therefore does not make the connection idle while that tool runs.
 
+The tracker reuses the final route's provider-executed tool classification, including declarations
+injected into the outbound request. `src/server/responses/response-tool-ownership.ts` carries that
+classification with the selected Response through body wrappers; failed combo attempts cannot
+authorize the winning response's calls. Hosted xAI search therefore creates no client-result wait.
+Each admitted ordinary turn starts a fresh returned-result deduplication scope after settling prior
+results, even if its upstream omits `response.created`. Native control keeps same-response echo
+suppression. `tests/responses/ws-capacity-tool-ownership.test.ts` covers these ownership boundaries.
+
 The victim is marked closing before sending close code 1001 with reason
 `Idle Responses connection reclaimed`. Only its ordinary close callback releases the
 admission lease; the upgrade retries reservation once afterward. If every socket is protected,
