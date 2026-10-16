@@ -25,11 +25,12 @@ let upstream: ReturnType<typeof Bun.serve> | undefined;
 let finishStream: (() => void) | undefined;
 let upstreamRequests = 0;
 let upstreamCancellations = 0;
+let heldUpstreamSignal: AbortSignal | undefined;
 const upstreamBodies: Frame[] = [];
 const clients: Client[] = [];
 
-async function until(condition: () => boolean, description: string): Promise<void> {
-  const deadline = Date.now() + 5_000;
+async function until(condition: () => boolean, description: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (!condition()) {
     if (Date.now() >= deadline) throw new Error(`Timed out: ${description}`);
     await Bun.sleep(2);
@@ -47,6 +48,7 @@ beforeEach(() => {
   codex = installIsolatedCodexHome("ocx-ws-capacity-codex-");
   upstreamRequests = 0;
   upstreamCancellations = 0;
+  heldUpstreamSignal = undefined;
   upstreamBodies.length = 0;
   finishStream = undefined;
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
@@ -54,10 +56,14 @@ beforeEach(() => {
     if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") {
       throw new Error("Capacity fixture forbids external requests");
     }
+    if (url.port === String(upstream?.port) && String(init?.body).includes("hold-fixture-stream")) {
+      heldUpstreamSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    }
     return originalFetch(input, init);
   }) as typeof fetch;
   upstream = Bun.serve({
-    hostname: "127.0.0.1", port: 0,
+    // Only proxy cancellation may end a held response; Bun's default idle timeout must not.
+    hostname: "127.0.0.1", port: 0, idleTimeout: 0,
     async fetch(request) {
       const body = await request.json() as Frame;
       upstreamRequests++;
@@ -221,20 +227,27 @@ test.each([false, true])("disconnect releases admission and allows a fresh reque
   expect(codexWebSocketAdmissionMetrics().active).toBe(baseline.active + 1);
   if (abrupt) {
     await exchange(client, { input: "hold-fixture-stream" }, "response.created");
+    expect(heldUpstreamSignal).toBeDefined();
+    expect(heldUpstreamSignal!.aborted).toBe(false);
     // Bun's client API terminates the real TCP connection without a closing handshake.
     client.socket.terminate();
   } else client.socket.close(1000, "fixture normal disconnect");
   await until(() => Boolean(client.closed) && codexWebSocketAdmissionMetrics().active === baseline.active,
     "disconnected socket releases its reservation");
   expect(client.closed?.code).toBe(abrupt ? 1006 : 1000);
-  if (abrupt) await until(() => upstreamCancellations === 1, "abandoned upstream stream cancelled");
   const replacement = await connect();
   await exchange(replacement, { input: "fresh request after disconnect" });
   expect(upstreamRequests).toBe(abrupt ? 2 : 1);
   replacement.socket.close();
   await until(() => codexWebSocketAdmissionMetrics().active === baseline.active, "replacement reservation released");
   expect(codexWebSocketAdmissionMetrics().releaseMisses).toBe(baseline.releaseMisses);
-});
+  // Eager relay preserves a real terminal during its existing 15-second discard-drain.
+  // Socket admission and the replacement request must recover before that separate cleanup.
+  if (abrupt) {
+    await until(() => heldUpstreamSignal!.aborted, "abandoned upstream request aborted", 20_000);
+    await until(() => upstreamCancellations === 1, "upstream observed request cancellation");
+  }
+}, 25_000);
 
 test("failed HTTP upgrade releases its reservation before the next handshake", async () => {
   const baseline = codexWebSocketAdmissionMetrics();

@@ -10,6 +10,7 @@ import { clearKeyCooldowns } from "../../src/providers/key-failover";
 import { createWebsocketHandler } from "../../src/server/index/websocket-handler";
 import type { ServeOptionsContext } from "../../src/server/index/serve-options";
 import { clearRequestLogsForTests } from "../../src/server/request-log";
+import { setRelayPlatformForTests } from "../../src/server/responses/passthrough-delivery";
 import type { WsData } from "../../src/server/ws-bridge";
 import type { OcxConfig } from "../../src/types";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
@@ -72,6 +73,7 @@ afterEach(async () => {
     } finally {
       try { releaseSpendHome(); }
       finally {
+        setRelayPlatformForTests(undefined);
         globalThis.fetch = originalFetch;
         for (const key of proxyKeys) {
           if (savedProxy[key] === undefined) delete process.env[key];
@@ -216,7 +218,11 @@ test("switching provider on the same socket does not retain the prior turn's hos
   expect(target.closed).toEqual([]);
 });
 
-test.each([false, true])("combo fallback uses the final response's tool ownership; hosted final=%s", async hostedFinal => {
+test.each([
+  ["darwin", false], ["darwin", true], ["win32", false], ["win32", true],
+] as const)("combo fallback uses the final response's tool ownership; relay=%s hosted final=%s", async (platform, hostedFinal) => {
+  // Exercise the eager Windows relay without changing filesystem/platform identity.
+  setRelayPlatformForTests(platform);
   const settings = twoProviderConfig();
   const targets = [{ provider: "fixture", model: "grok-4.6" }, { provider: "ordinary", model: "fixture-model" }];
   if (hostedFinal) targets.reverse();

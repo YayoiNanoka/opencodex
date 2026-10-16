@@ -10,7 +10,7 @@ import { createWebsocketHandler } from "../../src/server/index/websocket-handler
 import type { ServeOptionsContext } from "../../src/server/index/serve-options";
 import { MAX_ACTIVE_TURNS, tryAdmitTurn } from "../../src/server/lifecycle";
 import type { NativeResponseControl } from "../../src/server/responses/native-response-control";
-import type { WsData } from "../../src/server/ws-bridge";
+import { sendResponseToWebSocket, type WsData } from "../../src/server/ws-bridge";
 
 type Frame = Record<string, unknown>;
 const leases: AdmissionReservation<ServerWebSocket<WsData>>[] = [];
@@ -60,6 +60,164 @@ function admittedSocket(mode: "normal" | "delayed" | "throw" = "normal") {
 function output(activity: CodexWebSocketActivity, item: Frame) {
   activity.observePayload(JSON.stringify({ type: "response.output_item.done", item }));
 }
+
+const argumentCompletions = [
+  ["function_call", "response.function_call_arguments.done", "function_call_output"],
+  ["custom_tool_call", "response.custom_tool_call_input.done", "custom_tool_call_output"],
+] as const;
+
+describe("Responses final tool arguments", () => {
+  test.each(argumentCompletions)("%s stays protected after EOF until the real handler accepts its result", async (type, done, result) => {
+    const client = admittedSocket();
+    const finish = client.activity.beginTurn([]);
+    const argumentField = type === "function_call" ? "arguments" : "input";
+    const frames = [
+      { type: "response.output_item.added", item: { type, id: "item", call_id: "call", name: "fixture_tool", [argumentField]: "" } },
+      { type: done, item_id: "item", [argumentField]: "{}" },
+    ];
+    await sendResponseToWebSocket(client.ws, new Response(
+      frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`).join(""),
+      { headers: { "content-type": "text/event-stream" } },
+    ), () => true, { onSsePayload: payload => client.activity.observePayload(payload) });
+    finish();
+    expect(client.sent.map(frame => frame.type)).toEqual(["response.output_item.added", done, "error"]);
+    expect(client.sent.at(-1)).toMatchObject({ error: { message: "Upstream stream ended before response terminal event" } });
+    expect(client.ws.data.cancel).toBeUndefined();
+    const others = Array.from({ length: MAX_TRACKED_CODEX_WEBSOCKETS - 1 }, () => admittedSocket());
+    const finishOthers = others.map(other => other.activity.beginTurn([]));
+    try {
+      expect(reserve()).toBeNull();
+      expect(client.closed).toEqual([]);
+      let accepted = false;
+      client.ws.data.nativeControl = { inject: () => { accepted = true; } } as unknown as NativeResponseControl;
+      handler.message(client.ws, JSON.stringify({ type: "response.inject", input: [{ type: result, call_id: "call", output: "done" }] }));
+      expect(accepted).toBe(true);
+      client.ws.data.nativeControl = undefined;
+      expect(reserve()).not.toBeNull();
+      expect(client.closed).toEqual([{ code: 1001, reason: "Idle Responses connection reclaimed" }]);
+    } finally {
+      client.ws.data.nativeControl = undefined;
+      for (const end of finishOthers) end();
+    }
+  });
+
+  test.each(argumentCompletions)("unfinished %s arguments do not invent pending client work", (type) => {
+    const activity = new CodexWebSocketActivity();
+    const finish = activity.beginTurn([]);
+    activity.observePayload(JSON.stringify({ type: "response.output_item.added", item: { type, id: "item", call_id: "call" } }));
+    finish();
+    expect(activity.idle).toBe(true);
+  });
+
+  test.each(argumentCompletions)("%s completion echoes stay settled and reused identities belong to the next turn", (type, done, resultType) => {
+    const activity = new CodexWebSocketActivity();
+    const call = { type, id: "reused-item", call_id: "reused-call" };
+    const result = { type: resultType, call_id: call.call_id, output: "done" };
+    const added = JSON.stringify({ type: "response.output_item.added", item: call });
+    const completed = JSON.stringify({ type: done, item_id: call.id });
+    for (const created of [true, false]) {
+      const finish = activity.beginTurn([result]);
+      if (created) activity.observePayload(JSON.stringify({ type: "response.created", response: { id: "response" } }));
+      activity.observePayload(added);
+      activity.observePayload(added); // A repeated identity is not a new call.
+      activity.observePayload(completed);
+      finish();
+      expect(activity.idle).toBe(false);
+      activity.acceptResults([result]);
+      activity.observePayload(completed);
+      output(activity, call);
+      activity.observePayload(JSON.stringify({ type: "response.completed", response: { output: [call] } }));
+      expect(activity.idle).toBe(true);
+    }
+  });
+
+  test("native response.created resets argument identities without suppressing a reused call", () => {
+    const activity = new CodexWebSocketActivity();
+    const finish = activity.beginTurn([]);
+    for (const id of ["first", "second"]) {
+      activity.observePayload(JSON.stringify({ type: "response.created", response: { id } }));
+      activity.observePayload(JSON.stringify({ type: "response.output_item.added", item: { type: "function_call", id: "item", call_id: id } }));
+      activity.observePayload(JSON.stringify({ type: "response.function_call_arguments.done", item_id: "item" }));
+      if (id === "first") activity.acceptResults([{ type: "function_call_output", call_id: id }]);
+    }
+    finish();
+    expect(activity.idle).toBe(false);
+    activity.acceptResults([{ type: "function_call_output", call_id: "second" }]);
+    expect(activity.idle).toBe(true);
+  });
+
+  test("hosted custom input completion stays idle only with this response's provider authorization", () => {
+    const activity = new CodexWebSocketActivity();
+    const hosted = new Set([{ itemType: "custom_tool_call", callIdPrefix: "xs_call-" }]);
+    const added = JSON.stringify({ type: "response.output_item.added", item: { type: "custom_tool_call", id: "item", call_id: "xs_call-1" } });
+    const done = JSON.stringify({ type: "response.custom_tool_call_input.done", item_id: "item" });
+    const first = activity.beginTurn([]);
+    activity.observePayload(added, hosted);
+    activity.observePayload(done, hosted);
+    first();
+    expect(activity.idle).toBe(true);
+    const second = activity.beginTurn([]);
+    activity.observePayload(added);
+    activity.observePayload(done);
+    second();
+    expect(activity.idle).toBe(false);
+    activity.acceptResults([{ type: "custom_tool_call_output", call_id: "xs_call-1" }]);
+    expect(activity.idle).toBe(true);
+  });
+
+  test("unknown, oversized and mismatched final argument identities remain protected", () => {
+    for (const item of [
+      undefined,
+      { type: "function_call", id: "", call_id: "call" },
+      { type: "function_call", id: "item", call_id: "" },
+      { type: "function_call", id: "item", call_id: "x".repeat(1025) },
+      { type: "function_call", id: "x".repeat(1025), call_id: "call" },
+      { type: "custom_tool_call", id: "item", call_id: "call" },
+    ]) {
+      const activity = new CodexWebSocketActivity();
+      const finish = activity.beginTurn([]);
+      activity.observePayload(JSON.stringify({ type: "response.output_item.added", item }));
+      activity.observePayload(JSON.stringify({ type: "response.function_call_arguments.done", item_id: item?.id ?? "unknown" }));
+      finish();
+      activity.acceptResults([{ type: "function_call_output", call_id: "call" }]);
+      expect(activity.idle).toBe(false);
+    }
+  });
+
+  test("conflicting or over-budget argument identities conservatively protect the socket", () => {
+    for (const conflict of [true, false]) {
+      const activity = new CodexWebSocketActivity();
+      const finish = activity.beginTurn([]);
+      for (let index = 0; index < (conflict ? 2 : 1025); index += 1) {
+        activity.observePayload(JSON.stringify({ type: "response.output_item.added", item: {
+          type: "function_call", id: conflict ? "conflict" : `item-${index}`, call_id: `call-${index}`,
+        } }));
+      }
+      finish();
+      expect(activity.idle).toBe(false);
+    }
+  });
+
+  test.each(argumentCompletions)("invalid %s redefinitions cannot reuse a prior result identity", (type, done, resultType) => {
+    for (const returnedFirst of [false, true]) {
+      for (const call_id of [undefined, "", "x".repeat(1025)]) {
+        const activity = new CodexWebSocketActivity();
+        const finish = activity.beginTurn([]);
+        const emit = (frame: Frame) => activity.observePayload(JSON.stringify(frame));
+        const result = { type: resultType, call_id: "prior", output: "done" };
+        emit({ type: "response.output_item.added", item: { type, id: "item", call_id: "prior" } });
+        emit({ type: done, item_id: "item" });
+        if (returnedFirst) activity.acceptResults([result]);
+        emit({ type: "response.output_item.added", item: { type, id: "item", call_id } });
+        emit({ type: done, item_id: "item" });
+        finish();
+        expect(activity.idle).toBe(false);
+        if (!returnedFirst) activity.acceptResults([result]);
+        expect(activity.idle).toBe(false);
+      }
+    }
+  });
+});
 
 describe("Responses socket activity", () => {
   test("overlapping superseded turns each keep their own idempotent busy reference", () => {

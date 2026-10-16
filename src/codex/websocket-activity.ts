@@ -31,6 +31,8 @@ export class CodexWebSocketActivity {
   private turns = 0;
   private pendingResults = new Set<string>();
   private returnedResults = new Set<string>();
+  // Hashed identities only; null marks a route-authorized provider-owned call.
+  private argumentCalls = new Map<string, { type: string; result: string | null }>();
   // Unknown/oversized identities cannot safely prove that client work finished.
   private untrackedResults = false;
 
@@ -50,6 +52,7 @@ export class CodexWebSocketActivity {
     // Ordinary creates start a new response even when its upstream omits response.created.
     // Prior results settle old waits, but cannot suppress new calls reusing their IDs.
     this.returnedResults.clear();
+    this.argumentCalls.clear();
     let finished = false;
     return () => {
       if (finished) return;
@@ -87,12 +90,43 @@ export class CodexWebSocketActivity {
     try { frame = JSON.parse(payload); } catch { return; }
     if (!record(frame)) return;
     // Native injection can return a result before the same terminal repeats its call.
-    if (frame.type === "response.created") this.returnedResults.clear();
+    if (frame.type === "response.created") {
+      this.returnedResults.clear();
+      this.argumentCalls.clear();
+    }
+    if (frame.type === "response.output_item.added") this.rememberArgumentCall(frame.item, providerExecuted);
+    if (frame.type === "response.function_call_arguments.done" || frame.type === "response.custom_tool_call_input.done") {
+      const type = frame.type === "response.function_call_arguments.done" ? "function_call" : "custom_tool_call";
+      const call = typeof frame.item_id === "string" && frame.item_id.length <= MAX_RESULT_ID_LENGTH
+        ? this.argumentCalls.get(resultKey("item", frame.item_id)) : undefined;
+      if (!call || call.type !== type) this.protectUntracked();
+      else if (call.result !== null) this.observeResultKey(call.result);
+    }
     if (frame.type === "response.output_item.done") this.observeOutput(frame.item, providerExecuted);
     if (["response.completed", "response.incomplete", "response.failed"].includes(String(frame.type))
       && record(frame.response) && Array.isArray(frame.response.output)) {
       for (const item of frame.response.output) this.observeOutput(item, providerExecuted);
     }
+  }
+
+  private rememberArgumentCall(item: unknown, providerExecuted?: ReadonlySet<ProviderExecutedCallType>): void {
+    if (!record(item) || (item.type !== "function_call" && item.type !== "custom_tool_call")) return;
+    if (typeof item.id !== "string" || !item.id.length || item.id.length > MAX_RESULT_ID_LENGTH) return;
+    const key = resultKey("item", item.id);
+    const hosted = providerExecuted && isAuthorizedProviderExecutedCall(item, providerExecuted);
+    if (!hosted && (typeof item.call_id !== "string" || !item.call_id.length || item.call_id.length > MAX_RESULT_ID_LENGTH)) {
+      if (this.argumentCalls.has(key)) this.protectUntracked();
+      return;
+    }
+    const result = hosted ? null : resultKey(resultTypes[item.type]!, item.call_id as string);
+    const previous = this.argumentCalls.get(key);
+    if (previous) {
+      if (previous.type !== item.type || previous.result !== result) this.protectUntracked();
+      return;
+    }
+    if (this.argumentCalls.size >= MAX_PENDING_RESULTS) { this.protectUntracked(); return; }
+    // An unfinished argument stream alone does not prove the client started work.
+    this.argumentCalls.set(key, { type: item.type, result });
   }
 
   private observeOutput(item: unknown, providerExecuted?: ReadonlySet<ProviderExecutedCallType>): void {
@@ -109,7 +143,10 @@ export class CodexWebSocketActivity {
       this.protectUntracked();
       return;
     }
-    const key = resultKey(resultTypes[item.type]!, id);
+    this.observeResultKey(resultKey(resultTypes[item.type]!, id));
+  }
+
+  private observeResultKey(key: string): void {
     if (this.pendingResults.has(key) || this.returnedResults.has(key)) return;
     if (this.pendingResults.size >= MAX_PENDING_RESULTS) this.protectUntracked();
     else this.pendingResults.add(key);
@@ -119,5 +156,6 @@ export class CodexWebSocketActivity {
     this.untrackedResults = true;
     this.pendingResults.clear();
     this.returnedResults.clear();
+    this.argumentCalls.clear();
   }
 }
