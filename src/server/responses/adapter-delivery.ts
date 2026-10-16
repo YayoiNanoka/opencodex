@@ -24,6 +24,7 @@ import { clientEncoderForDelivery, deliverClientEncodedResponse } from "../infer
 import { noteKiroServedSuccess } from "../../providers/kiro-usage";
 import { persistKiroAccountState } from "../../providers/kiro-account-state-disk";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
+import { guardEmptyToolCatalogEvents, guardEmptyToolCatalogStream } from "../../lib/empty-tool-catalog";
 
 /** One responsibility of the Responses request pipeline; state owners are explicit. */
 export async function deliverAdapterResponse(
@@ -34,6 +35,7 @@ export async function deliverAdapterResponse(
     | "route"
     | "translatorBudget"
     | "toolBridgeMaps"
+    | "clientToolCatalogRestriction"
     | "rememberKiroDeliveredFinalAnswer"
     | "responseStateOptions"
   >,
@@ -75,6 +77,10 @@ export async function deliverAdapterResponse(
   const { routedCompaction } = sidecarState;
   const bodyInactivityMs = resolveStallTimeoutMs(config.stallTimeoutSec, { localUpstream });
   const upstreamRequestsStream = parsed.stream || isCanonicalOpenAiForwardProvider(route.provider);
+  const clientToolCatalog = requestState.clientToolCatalogRestriction && route.provider.authMode !== "forward"
+    ? requestState.clientToolCatalogRestriction : undefined;
+  const deliveryToolBridgeMaps = clientToolCatalog
+    ? { ...toolBridgeMaps, ...clientToolCatalog } : toolBridgeMaps;
 
 
   if (parsed.stream) {
@@ -121,6 +127,7 @@ export async function deliverAdapterResponse(
     const advisorStream = parsed._advisorGuard
       ? parsed._advisorGuard({
           parsed,
+          translatorBudget,
           firstEvents: eventStream,
           continuation: fetchTerminalGuardContinuation,
         })
@@ -129,13 +136,14 @@ export async function deliverAdapterResponse(
     // turn with no text and no tool call is retried with the IDENTICAL request
     // (fetchTerminalGuardContinuation(parsed) replays the cached byte-identical
     // request — same body, same headers, same signal).
-    const guardedEventStream = emptyCompletionGuardEnabled
+    const completionGuardedEventStream = emptyCompletionGuardEnabled
       ? guardEmptyCompletionEventStream({
           firstEvents: advisorStream,
           continuation: fetchGuardedEmptyCompletionRetry,
         })
       : advisorStream;
-    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = toolBridgeMaps;
+    const guardedEventStream = guardEmptyToolCatalogStream(completionGuardedEventStream, clientToolCatalog, translatorBudget);
+    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = deliveryToolBridgeMaps;
     // One completion owner for both deliveries: the bridge calls it from its terminal, the
     // direct client encoder from the fold of the same events.
     const onCompletedResponse = (response: Record<string, unknown>, providerState?: OcxProviderContinuationState) => {
@@ -157,7 +165,9 @@ export async function deliverAdapterResponse(
       }
       notifyResponseComplete(response);
     };
-    const clientEncoder = clientEncoderForDelivery(options, logCtx, !!routedCompaction, transportState.activeAdapter.name);
+    // The Responses bridge owns code-mode helper compilation; the direct encoder only renames.
+    const clientEncoder = clientToolCatalog?.bareCustomToolNames.has("exec") ? undefined
+      : clientEncoderForDelivery(options, logCtx, !!routedCompaction, transportState.activeAdapter.name);
     if (clientEncoder) {
       return deliverClientEncodedResponse({
         encoder: clientEncoder,
@@ -196,9 +206,10 @@ export async function deliverAdapterResponse(
         declaredToolNames,
         bareCustomToolNames,
         enforceDeclaredToolNames: options.inboundWire !== "chat" && options.inboundWire !== "anthropic",
+        terminalRefusalAsFailed: options.inboundWire !== "chat" && options.inboundWire !== "anthropic",
         toolParameterSchemas,
         ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
-        ...(routedCompaction ? { compaction: true } : {}),
+        ...(routedCompaction ? { compaction: true, compactionRetention: parsed._compactionRetention } : {}),
         // Same grok-surface split as the runTurn branch above.
         ...(logCtx.surface === "grok" ? { heartbeatStyle: "comment" as const } : {}),
         onUsage: usage => {
@@ -257,6 +268,7 @@ export async function deliverAdapterResponse(
         const advisorEvents: AdapterEvent[] = [];
         for await (const event of parsed._advisorGuard({
           parsed,
+          translatorBudget,
           firstEvents: (async function* () { yield* guardedEvents; })(),
           continuation: fetchTerminalGuardContinuation,
         })) advisorEvents.push(event);
@@ -279,8 +291,9 @@ export async function deliverAdapterResponse(
     } finally {
       cleanupUpstreamAbort();
     }
-    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = toolBridgeMaps;
+    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = deliveryToolBridgeMaps;
     let providerState: OcxProviderContinuationState | undefined;
+    events = guardEmptyToolCatalogEvents(events, clientToolCatalog, translatorBudget);
     const json = buildResponseJSON(events, parsed._responseModelId ?? parsed.modelId, {
       translatorBudget,
       replayCacheScope: parsed._reasoningReplayScope,
@@ -293,7 +306,7 @@ export async function deliverAdapterResponse(
       toolParameterSchemas,
       freeformToolNames,
       toolSearchToolNames,
-      ...(routedCompaction ? { compaction: true } : {}),
+      ...(routedCompaction ? { compaction: true, compactionRetention: parsed._compactionRetention } : {}),
       onProviderState: state => { providerState = state; },
       onUsage: usage => {
         transportState.bindKeyUsageFromBridge(usage);
