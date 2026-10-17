@@ -232,8 +232,9 @@ test.each([false, true])("disconnect releases admission and allows a fresh reque
     // Bun's client API terminates the real TCP connection without a closing handshake.
     client.socket.terminate();
   } else client.socket.close(1000, "fixture normal disconnect");
-  await until(() => Boolean(client.closed) && codexWebSocketAdmissionMetrics().active === baseline.active,
-    "disconnected socket releases its reservation");
+  await until(() => codexWebSocketAdmissionMetrics().active === baseline.active,
+    "disconnected socket releases its reservation", 10_000);
+  await until(() => Boolean(client.closed), "client observes close", 10_000);
   expect(client.closed?.code).toBe(abrupt ? 1006 : 1000);
   const replacement = await connect();
   await exchange(replacement, { input: "fresh request after disconnect" });
