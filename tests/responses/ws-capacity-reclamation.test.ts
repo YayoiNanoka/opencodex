@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +28,8 @@ let upstreamCancellations = 0;
 let heldUpstreamSignal: AbortSignal | undefined;
 const upstreamBodies: Frame[] = [];
 const clients: Client[] = [];
+const refusedHandshakes = new Map<string, { status: number; retryAfter: string | null }>();
+let closeReleaseDelayMs = 0;
 
 async function until(condition: () => boolean, description: string, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -51,6 +53,8 @@ beforeEach(() => {
   heldUpstreamSignal = undefined;
   upstreamBodies.length = 0;
   finishStream = undefined;
+  refusedHandshakes.clear();
+  closeReleaseDelayMs = 0;
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") {
@@ -98,7 +102,23 @@ beforeEach(() => {
     } },
   } as OcxConfig);
   expect(codexWebSocketAdmissionMetrics().active).toBe(0);
-  proxy = startServer(0);
+  // Observe actual upgrade refusals; delay only the fixture close callback in the delayed row.
+  const originalServe = Bun.serve;
+  const serveSpy = spyOn(Bun, "serve").mockImplementation(((options: any) => originalServe({
+    ...options,
+    async fetch(request: Request, server: any) {
+      const response = await options.fetch(request, server);
+      const attempt = new URL(request.url).searchParams.get("capacity-attempt");
+      if (attempt !== null && response) refusedHandshakes.set(attempt,
+        { status: response.status, retryAfter: response.headers.get("retry-after") });
+      return response;
+    },
+    websocket: { ...options.websocket, close(...args: any[]) {
+      if (closeReleaseDelayMs) setTimeout(() => options.websocket.close(...args), closeReleaseDelayMs);
+      else options.websocket.close(...args);
+    } },
+  })) as typeof Bun.serve);
+  try { proxy = startServer(0); } finally { serveSpy.mockRestore(); }
 });
 
 afterEach(async () => {
@@ -120,16 +140,24 @@ afterEach(async () => {
   }
 });
 
-async function connect(): Promise<Client> {
+async function connect(retriesRemaining = MAX_TRACKED_CODEX_WEBSOCKETS): Promise<Client> {
   const url = new URL("/v1/responses", proxy!.url);
   url.protocol = "ws:";
+  const attempt = String(clients.length);
+  url.searchParams.set("capacity-attempt", attempt);
   const client: Client = { socket: new WebSocket(url), frames: [] };
   clients.push(client);
   client.socket.addEventListener("message", event => client.frames.push(JSON.parse(String(event.data))));
   client.socket.addEventListener("close", event => { client.closed = event; });
   client.socket.addEventListener("error", event => { client.error = event; });
   await until(() => client.socket.readyState === WebSocket.OPEN || Boolean(client.error || client.closed), "socket handshake");
-  if (client.socket.readyState !== WebSocket.OPEN) throw new Error("Capacity fixture socket handshake failed");
+  if (client.socket.readyState !== WebSocket.OPEN) {
+    expect(refusedHandshakes.get(attempt)).toEqual({ status: 503, retryAfter: "1" });
+    await until(() => codexWebSocketAdmissionMetrics().active < MAX_TRACKED_CODEX_WEBSOCKETS,
+      "reclaimed socket releases admission before retry");
+    expect(retriesRemaining).toBeGreaterThan(0);
+    return connect(retriesRemaining - 1);
+  }
   return client;
 }
 
@@ -156,7 +184,8 @@ function expectBounded(): void {
   expect(metrics.releaseMisses).toBe(0);
 }
 
-test("the 129th handshake reclaims the least recently used idle socket and reconnects cleanly", async () => {
+test.each([0, 20])("the 129th handshake reclaims the least recently used idle socket and reconnects cleanly; close delay=%s", async delay => {
+  closeReleaseDelayMs = delay;
   const opened = await fill();
   expect(opened.every(client => client.socket.readyState === WebSocket.OPEN)).toBe(true);
   await exchange(opened[0]!, { generate: false });
@@ -164,6 +193,7 @@ test("the 129th handshake reclaims the least recently used idle socket and recon
   const replacement = await connect();
   await until(() => Boolean(opened[1]!.closed), "least recently used idle socket closed");
   expect(opened[1]!.closed?.code).toBe(1001);
+  if (delay) expect([...refusedHandshakes.values()].some(response => response.status === 503)).toBe(true);
   expect(opened[0]!.socket.readyState).toBe(WebSocket.OPEN);
   expectBounded();
   await exchange(replacement, { input: "fresh request after capacity recovery" });
